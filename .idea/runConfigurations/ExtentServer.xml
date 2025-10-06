@@ -1,0 +1,10 @@
+<component name="ProjectRunConfigurationManager">
+  <configuration default="false" name="ExtentServer" type="Application" factoryName="Application">
+    <option name="MAIN_CLASS_NAME" value="sk.tuke.dfs.extent.ExtentServer" />
+    <module name="DFS" />
+    <option name="PROGRAM_PARAMETERS" value="8081 $PROJECT_DIR$/dfs_dir" />
+    <method v="2">
+      <option name="Make" enabled="true" />
+    </method>
+  </configuration>
+</component>
