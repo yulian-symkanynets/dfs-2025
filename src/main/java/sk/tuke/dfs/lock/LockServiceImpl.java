@@ -105,11 +105,10 @@ public class LockServiceImpl extends LockServiceGrpc.LockServiceImplBase {
             r.ownerId = null;
             r.revokeSent = false;
 
-            // Send retry to next waiting client (if any) with updated sequence
+            // Send retry to next waiting client (if any) with their sequence
             String next = r.waitingClients.poll();
             if (next != null) {
-                long nextSeq = r.clientSequences.getOrDefault(next, 0L) + 1;
-                r.clientSequences.put(next, nextSeq);
+                long nextSeq = r.clientSequences.getOrDefault(next, 0L);
                 retryQueue.add(new RetryRequest(lid, next, nextSeq));
                 logger.info("[Release] Queued retry for " + lid + " to " + next + " seq=" + nextSeq);
             }
