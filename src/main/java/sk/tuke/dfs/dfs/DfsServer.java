@@ -61,7 +61,7 @@ public class DfsServer {
 
         // -------------------- Start Releaser Thread ONCE --------------------
         Thread releaserThread = new Thread(
-                new Releaser(releaseQueue, lockStateMap, lockCh, dfsOwnerId),
+                new Releaser(releaseQueue, lockStateMap, lockCh, dfsOwnerId, lockSequences),
                 "ReleaserThread"
         );
         releaserThread.setDaemon(true);

@@ -27,6 +27,7 @@ public class LockServiceImpl extends LockServiceGrpc.LockServiceImplBase {
                         StreamObserver<LockServiceOuterClass.AcquireResponse> respObs) {
         String lid = req.getLockId();
         String cid = req.getOwnerId();
+        long reqSeq = req.getSequence();
 
         LockRecord r = concurrentHashMap.computeIfAbsent(lid, k -> {
             LockRecord lr = new LockRecord();
@@ -35,29 +36,41 @@ public class LockServiceImpl extends LockServiceGrpc.LockServiceImplBase {
         });
 
         synchronized (r) {
-            // free → grant
+            // Check if lock is free → grant it
             if (r.ownerId == null) {
                 r.ownerId = cid;
-                r.sequence++;
+                long newSeq = r.clientSequences.getOrDefault(cid, 0L) + 1;
+                r.clientSequences.put(cid, newSeq);
+                logger.info("[Acquire] Granting lock " + lid + " to " + cid + " with seq=" + newSeq);
                 respObs.onNext(LockServiceOuterClass.AcquireResponse.newBuilder()
                         .setSuccess(true).build());
                 respObs.onCompleted();
                 return;
             }
-            // same owner → ok (cached)
+            
+            // Same owner → already cached, grant again
             if (r.ownerId.equals(cid)) {
+                logger.info("[Acquire] Lock " + lid + " already owned by " + cid + " (cached)");
                 respObs.onNext(LockServiceOuterClass.AcquireResponse.newBuilder()
                         .setSuccess(true).build());
                 respObs.onCompleted();
                 return;
             }
-            // otherwise enqueue + revoke current owner (only once)
-            if (!r.waitingClients.contains(cid))
+            
+            // Lock held by different client → RETRY
+            logger.info("[Acquire] Lock " + lid + " held by " + r.ownerId + ", denying " + cid);
+            
+            // Add to waiting list if not already there
+            if (!r.waitingClients.contains(cid)) {
                 r.waitingClients.add(cid);
+                logger.info("[Acquire] Added " + cid + " to wait queue for " + lid);
+            }
 
+            // Send revoke to current owner (only once)
             if (!r.revokeSent) {
                 revokeQueue.add(new RevokeRequest(lid, r.ownerId));
                 r.revokeSent = true;
+                logger.info("[Acquire] Queued revoke for " + lid + " to " + r.ownerId);
             }
 
             respObs.onNext(LockServiceOuterClass.AcquireResponse.newBuilder()
@@ -71,23 +84,32 @@ public class LockServiceImpl extends LockServiceGrpc.LockServiceImplBase {
                         StreamObserver<LockServiceOuterClass.ReleaseResponse> respObs) {
         String lid = req.getLockId();
         String cid = req.getOwnerId();
+        long reqSeq = req.getSequence();
 
         LockRecord r = concurrentHashMap.computeIfAbsent(lid, k -> new LockRecord());
         synchronized (r) {
-            // ignore wrong owner
+            // Ignore if not owned by this client
             if (r.ownerId == null || !r.ownerId.equals(cid)) {
+                logger.info("[Release] Ignoring release of " + lid + " from " + cid + " (not owner)");
                 respObs.onNext(LockServiceOuterClass.ReleaseResponse.getDefaultInstance());
                 respObs.onCompleted();
                 return;
             }
+            
+            logger.info("[Release] Releasing lock " + lid + " from " + cid + " seq=" + reqSeq);
+            
+            // Release the lock
             r.ownerId = null;
-            r.sequence++;
-            r.revokeSent = false;  // ✅ Reset flag
+            r.revokeSent = false;
 
-            // notify next waiting client
+            // Send retry to next waiting client (if any) with updated sequence
             String next = r.waitingClients.poll();
-            if (next != null)
-                retryQueue.add(new RetryRequest(lid, next, r.sequence));
+            if (next != null) {
+                long nextSeq = r.clientSequences.getOrDefault(next, 0L) + 1;
+                r.clientSequences.put(next, nextSeq);
+                retryQueue.add(new RetryRequest(lid, next, nextSeq));
+                logger.info("[Release] Queued retry for " + lid + " to " + next + " seq=" + nextSeq);
+            }
 
             respObs.onNext(LockServiceOuterClass.ReleaseResponse.getDefaultInstance());
             respObs.onCompleted();

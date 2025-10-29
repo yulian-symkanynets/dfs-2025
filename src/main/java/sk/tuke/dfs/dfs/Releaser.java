@@ -14,6 +14,7 @@ public class Releaser implements Runnable {
 
     private final BlockingQueue<String> blockingQueue;
     private final ConcurrentHashMap<String, LockState> lockStateMap;
+    private final ConcurrentHashMap<String, Long> lockSequences;
     private final ManagedChannel lockChannel;
     private final String ownerId;
     private volatile boolean running = true;
@@ -21,11 +22,13 @@ public class Releaser implements Runnable {
     public Releaser(BlockingQueue<String> queue,
                     ConcurrentHashMap<String, LockState> map,
                     ManagedChannel channel,
-                    String ownerId) {
+                    String ownerId,
+                    ConcurrentHashMap<String, Long> lockSequences) {
         this.blockingQueue = queue;
         this.lockStateMap = map;
         this.lockChannel = channel;
         this.ownerId = ownerId;
+        this.lockSequences = lockSequences;
     }
 
     @Override
@@ -39,17 +42,20 @@ public class Releaser implements Runnable {
 
                 logger.info("[Releaser] Processing release for " + lockId);
 
-                // Always release, regardless of current state
+                // Get current sequence for this lock
+                long seq = lockSequences.getOrDefault(lockId, 0L);
+                
                 try {
                     lockStub.release(
                             LockServiceOuterClass.ReleaseRequest.newBuilder()
                                     .setLockId(lockId)
                                     .setOwnerId(ownerId)
+                                    .setSequence(seq)
                                     .build()
                     );
 
                     lockStateMap.put(lockId, LockState.NONE);
-                    logger.info("[Releaser] Successfully released lock " + lockId + " → NONE");
+                    logger.info("[Releaser] Successfully released lock " + lockId + " → NONE (seq=" + seq + ")");
 
                 } catch (Exception e) {
                     logger.warning("[Releaser] Error releasing lock " + lockId + ": " + e.getMessage());
