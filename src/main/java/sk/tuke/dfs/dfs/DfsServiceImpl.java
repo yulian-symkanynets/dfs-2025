@@ -8,7 +8,6 @@ import dfs.lock.LockServiceGrpc;
 import dfs.lock.LockServiceOuterClass;
 import io.grpc.stub.StreamObserver;
 
-import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.logging.Logger;
 
@@ -16,11 +15,7 @@ public class DfsServiceImpl extends DfsServiceGrpc.DfsServiceImplBase {
 
     private static final Logger logger = Logger.getLogger(DfsServiceImpl.class.getName());
 
-    private final ConcurrentHashMap<String, LockState> lockStateMap;
-    private final ConcurrentHashMap<String, Object> waiters;
-    private final BlockingQueue<String> releaseQueue;
-    private final ConcurrentHashMap<String, Long> lockSequences;
-
+    private final ConcurrentHashMap<String, LockEntry> lockTable;
     private final LockServiceGrpc.LockServiceBlockingStub lockStub;
     private final ExtentServiceGrpc.ExtentServiceBlockingStub extentStub;
     private final String ownerId;
@@ -28,96 +23,69 @@ public class DfsServiceImpl extends DfsServiceGrpc.DfsServiceImplBase {
     public DfsServiceImpl(LockServiceGrpc.LockServiceBlockingStub lockStub,
                           ExtentServiceGrpc.ExtentServiceBlockingStub extentStub,
                           String ownerId,
-                          io.grpc.ManagedChannel lockChannel,
-                          ConcurrentHashMap<String, Long> lockSequences,
-                          ConcurrentHashMap<String, LockState> lockStateMap,
-                          ConcurrentHashMap<String, Object> waiters,
-                          BlockingQueue<String> releaseQueue) {
+                          ConcurrentHashMap<String, LockEntry> lockTable) {
         this.lockStub = lockStub;
         this.extentStub = extentStub;
         this.ownerId = ownerId;
-        this.lockSequences = lockSequences;
-        this.lockStateMap = lockStateMap;
-        this.waiters = waiters;
-        this.releaseQueue = releaseQueue;
+        this.lockTable = lockTable;
     }
 
-    private Object waiter(String lockId) {
-        return waiters.computeIfAbsent(lockId, k -> new Object());
-    }
+    private boolean acquireLock(String lockId) throws InterruptedException {
+        logger.info("[AcquireLock] Acquiring lock for " + lockId);
 
-    private boolean tryAcquireLock(String lid) {
-        long seq = lockSequences.getOrDefault(lid, 0L);
-        logger.info("[TryAcquire] Attempting to acquire " + lid + " with seq=" + seq);
+        LockEntry lockEntry = lockTable.computeIfAbsent(lockId, LockEntry::new);
 
-        var res = lockStub.acquire(LockServiceOuterClass.AcquireRequest.newBuilder()
-                .setLockId(lid)
-                .setOwnerId(ownerId)
-                .setSequence(seq)
-                .build());
+        // If lock is in NONE state, we need to acquire it from lock service
+        if (lockEntry.getStatus() == LockState.NONE) {
+            lockEntry.setStatus(LockState.ACQUIRING);
+            logger.info("[AcquireLock] Status is NONE, requesting from lock service");
 
-        logger.info("[TryAcquire] Result for " + lid + ": " + res.getSuccess());
-        return res.getSuccess();
+            var response = lockStub.acquire(
+                LockServiceOuterClass.AcquireRequest.newBuilder()
+                    .setLockId(lockId)
+                    .setOwnerId(ownerId)
+                    .setSequence(lockEntry.getSequence().incrementAndGet())
+                    .build()
+            );
+
+            if (!response.getSuccess()) {
+                logger.info("[AcquireLock] Lock denied, waiting for retry signal");
+                // Wait for retry signal from lock service
+                lockEntry.getFreeSignal().acquire();
+            }
+
+            // Acquire the mutex (mutual exclusion)
+            lockEntry.getMutex().acquire();
+            lockEntry.setStatus(LockState.LOCKED);
+            logger.info("[AcquireLock] Lock acquired and status set to LOCKED");
+        } else {
+            // Lock already acquired by us, just get the mutex
+            logger.info("[AcquireLock] Lock already held, acquiring mutex");
+            lockEntry.getMutex().acquire();
+            lockEntry.setStatus(LockState.LOCKED);
+        }
+
+        return true;
     }
 
     private void releaseLock(String lockId) {
-        LockState state = lockStateMap.getOrDefault(lockId, LockState.NONE);
-        logger.info("[ReleaseLock] Releasing " + lockId + " (current state: " + state + ")");
+        logger.info("[ReleaseLock] Releasing lock for " + lockId);
 
-        if (state == LockState.NONE) {
-            logger.info("[ReleaseLock] Lock " + lockId + " already NONE, skipping");
+        LockEntry lockEntry = lockTable.get(lockId);
+        if (lockEntry == null) {
+            logger.info("[ReleaseLock] Lock entry not found, nothing to release");
             return;
         }
 
-        lockStateMap.put(lockId, LockState.RELEASING);
+        // Release the mutex
+        lockEntry.getMutex().release();
+        lockEntry.setStatus(LockState.FREE);
+        logger.info("[ReleaseLock] Mutex released, status set to FREE");
 
-        try {
-            lockStub.release(
-                    LockServiceOuterClass.ReleaseRequest.newBuilder()
-                            .setLockId(lockId)
-                            .setOwnerId(ownerId)
-                            .build()
-            );
-
-            logger.info("[ReleaseLock] Successfully released " + lockId);
-        } catch (Exception e) {
-            logger.warning("[ReleaseLock] Error releasing " + lockId + ": " + e.getMessage());
-        } finally {
-            lockStateMap.put(lockId, LockState.NONE);
-            logger.info("[ReleaseLock] State set to NONE for " + lockId);
-        }
-    }
-
-    private void waitAndAcquire(String lockId) {
-        logger.info("[WaitAndAcquire] Starting for " + lockId);
-        lockStateMap.put(lockId, LockState.ACQUIRING);
-
-        while (true) {
-            if (tryAcquireLock(lockId)) {
-                lockStateMap.put(lockId, LockState.LOCKED);
-                logger.info("[WaitAndAcquire] Successfully acquired " + lockId);
-                return;
-            }
-
-            logger.info("[WaitAndAcquire] Failed to acquire " + lockId + ", waiting for retry...");
-
-            synchronized (waiter(lockId)) {
-                LockState state = lockStateMap.get(lockId);
-                if (state == LockState.FREE) {
-                    logger.info("[WaitAndAcquire] State is FREE, retrying acquire");
-                    continue;
-                }
-
-                try {
-                    logger.info("[WaitAndAcquire] Waiting on monitor for " + lockId);
-                    waiter(lockId).wait(5000);
-                    logger.info("[WaitAndAcquire] Woke up for " + lockId);
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    logger.severe("[WaitAndAcquire] Interrupted while waiting for " + lockId);
-                    throw new RuntimeException(e);
-                }
-            }
+        // If revoked, signal that we're ready to release
+        if (lockEntry.getRevoked().get()) {
+            logger.info("[ReleaseLock] Lock was revoked, releasing freeSignal");
+            lockEntry.getFreeSignal().release();
         }
     }
 
@@ -133,7 +101,7 @@ public class DfsServiceImpl extends DfsServiceGrpc.DfsServiceImplBase {
         }
 
         try {
-            waitAndAcquire(dirName);
+            acquireLock(dirName);
 
             ExtentServiceOuterClass.GetResponse getResp =
                     extentStub.get(ExtentServiceOuterClass.GetRequest.newBuilder()
@@ -182,7 +150,7 @@ public class DfsServiceImpl extends DfsServiceGrpc.DfsServiceImplBase {
         }
 
         try {
-            waitAndAcquire(dirName);
+            acquireLock(dirName);
 
             var putResp = extentStub.put(ExtentServiceOuterClass.PutRequest.newBuilder()
                     .setFileName(dirName)
@@ -213,7 +181,7 @@ public class DfsServiceImpl extends DfsServiceGrpc.DfsServiceImplBase {
         }
 
         try {
-            waitAndAcquire(fileName);
+            acquireLock(fileName);
 
             var getResp = extentStub.get(ExtentServiceOuterClass.GetRequest.newBuilder()
                     .setFileName(fileName)
@@ -244,8 +212,8 @@ public class DfsServiceImpl extends DfsServiceGrpc.DfsServiceImplBase {
         }
 
         try {
-            logger.info("[PUT] Calling waitAndAcquire for " + file);
-            waitAndAcquire(file);
+            logger.info("[PUT] Acquiring lock for " + file);
+            acquireLock(file);
             logger.info("[PUT] Lock acquired for " + file + ", calling extent service");
 
             var p = extentStub.put(
@@ -286,8 +254,8 @@ public class DfsServiceImpl extends DfsServiceGrpc.DfsServiceImplBase {
         }
 
         try {
-            logger.info("[DELETE] Calling waitAndAcquire for " + fileName);
-            waitAndAcquire(fileName);
+            logger.info("[DELETE] Acquiring lock for " + fileName);
+            acquireLock(fileName);
             logger.info("[DELETE] Lock acquired for " + fileName);
 
             var r = extentStub.put(
