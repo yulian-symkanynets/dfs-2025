@@ -80,8 +80,7 @@ public class LockCacheServiceImpl extends LockCacheServiceGrpc.LockCacheServiceI
                 logger.warning("[Revoke] Interrupted while waiting");
                 Thread.currentThread().interrupt();
             } catch (Exception e) {
-                logger.warning("[Revoke] Error releasing lock: " + e.getMessage());
-                e.printStackTrace();
+                logger.severe("[Revoke] Error releasing lock: " + e.getMessage());
             }
         });
 
