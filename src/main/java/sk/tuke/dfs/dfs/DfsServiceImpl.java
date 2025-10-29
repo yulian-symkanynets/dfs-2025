@@ -47,10 +47,11 @@ public class DfsServiceImpl extends DfsServiceGrpc.DfsServiceImplBase {
     }
 
     private boolean tryAcquireLock(String lid) {
-        // Use current sequence value (updated by retry or starting from 1)
+        // Use current sequence value (set by retry or increment for new attempts)
         long seq = lockSequences.getOrDefault(lid, 0L);
         if (seq == 0) {
-            seq = 1;  // First acquire starts at 1
+            // First acquire for this lock
+            seq = 1;
             lockSequences.put(lid, seq);
         }
         
@@ -99,6 +100,11 @@ public class DfsServiceImpl extends DfsServiceGrpc.DfsServiceImplBase {
             logger.info("[WaitAndAcquire] Lock " + lockId + " was cached (FREE), now LOCKED");
             return;
         }
+        
+        // Starting a new acquire from server - increment sequence
+        long seq = lockSequences.getOrDefault(lockId, 0L) + 1;
+        lockSequences.put(lockId, seq);
+        logger.info("[WaitAndAcquire] New acquire for " + lockId + ", incremented seq to " + seq);
         
         lockStateMap.put(lockId, LockState.ACQUIRING);
 
