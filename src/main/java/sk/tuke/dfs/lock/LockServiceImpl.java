@@ -39,9 +39,8 @@ public class LockServiceImpl extends LockServiceGrpc.LockServiceImplBase {
             // Check if lock is free → grant it
             if (r.ownerId == null) {
                 r.ownerId = cid;
-                long newSeq = r.clientSequences.getOrDefault(cid, 0L) + 1;
-                r.clientSequences.put(cid, newSeq);
-                logger.info("[Acquire] Granting lock " + lid + " to " + cid + " with seq=" + newSeq);
+                r.clientSequences.put(cid, reqSeq);  // Remember client's sequence
+                logger.info("[Acquire] Granting lock " + lid + " to " + cid + " with seq=" + reqSeq);
                 respObs.onNext(LockServiceOuterClass.AcquireResponse.newBuilder()
                         .setSuccess(true).build());
                 respObs.onCompleted();
@@ -50,7 +49,8 @@ public class LockServiceImpl extends LockServiceGrpc.LockServiceImplBase {
             
             // Same owner → already cached, grant again
             if (r.ownerId.equals(cid)) {
-                logger.info("[Acquire] Lock " + lid + " already owned by " + cid + " (cached)");
+                r.clientSequences.put(cid, reqSeq);  // Update sequence
+                logger.info("[Acquire] Lock " + lid + " already owned by " + cid + " (cached) seq=" + reqSeq);
                 respObs.onNext(LockServiceOuterClass.AcquireResponse.newBuilder()
                         .setSuccess(true).build());
                 respObs.onCompleted();
@@ -59,6 +59,9 @@ public class LockServiceImpl extends LockServiceGrpc.LockServiceImplBase {
             
             // Lock held by different client → RETRY
             logger.info("[Acquire] Lock " + lid + " held by " + r.ownerId + ", denying " + cid);
+            
+            // Remember the waiting client's sequence
+            r.clientSequences.put(cid, reqSeq);
             
             // Add to waiting list if not already there
             if (!r.waitingClients.contains(cid)) {

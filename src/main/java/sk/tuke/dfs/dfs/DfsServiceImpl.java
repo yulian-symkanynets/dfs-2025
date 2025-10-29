@@ -47,7 +47,13 @@ public class DfsServiceImpl extends DfsServiceGrpc.DfsServiceImplBase {
     }
 
     private boolean tryAcquireLock(String lid) {
+        // Use current sequence value (updated by retry or starting from 1)
         long seq = lockSequences.getOrDefault(lid, 0L);
+        if (seq == 0) {
+            seq = 1;  // First acquire starts at 1
+            lockSequences.put(lid, seq);
+        }
+        
         logger.info("[TryAcquire] Attempting to acquire " + lid + " with seq=" + seq);
 
         var res = lockStub.acquire(LockServiceOuterClass.AcquireRequest.newBuilder()
