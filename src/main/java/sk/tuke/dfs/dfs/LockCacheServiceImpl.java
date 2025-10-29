@@ -89,8 +89,8 @@ public class LockCacheServiceImpl extends LockCacheServiceGrpc.LockCacheServiceI
         logger.info("[Retry] Received retry for " + lid + " seq=" + seq);
 
         long old = lockSequences.getOrDefault(lid, 0L);
-        if (seq < old) {
-            logger.info("[Retry] Stale retry (seq=" + seq + " < old=" + old + ")");
+        if (seq <= old) {
+            logger.info("[Retry] Stale retry (seq=" + seq + " <= old=" + old + ")");
             resp.onNext(LockCacheServiceOuterClass.RetryResponse.getDefaultInstance());
             resp.onCompleted();
             return;
