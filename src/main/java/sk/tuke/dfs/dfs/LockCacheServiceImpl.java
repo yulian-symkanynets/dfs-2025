@@ -45,20 +45,24 @@ public class LockCacheServiceImpl extends LockCacheServiceGrpc.LockCacheServiceI
             return;
         }
 
+        // Capture current status before changing it
+        LockState currentStatus = lockEntry.getStatus();
         lockEntry.setStatus(LockState.RELEASING);
         lockEntry.getRevoked().set(true);
-
-        logger.info("[Revoke] Marked as RELEASING, submitting async release task");
+        logger.info("[Revoke] Current status was " + currentStatus + ", set to RELEASING and revoked flag");
 
         threadPool.submit(() -> {
             try {
-                logger.info("[Revoke] Waiting for lock to be FREE before releasing");
-                // Wait until lock is FREE (mutex is released)
-                if (lockEntry.getStatus() == LockState.LOCKED) {
+                logger.info("[Revoke] Async task started");
+                // If an operation was in progress when revoke arrived (status was LOCKED),
+                // wait for it to finish and signal via freeSignal
+                if (currentStatus == LockState.LOCKED) {
+                    logger.info("[Revoke] Operation was in progress, waiting for freeSignal");
                     lockEntry.getFreeSignal().acquire();
+                    logger.info("[Revoke] freeSignal received, operation completed");
                 }
-
-                logger.info("[Revoke] Releasing lock to lock service");
+                
+                logger.info("[Revoke] Releasing to lock service");
                 LockServiceGrpc.LockServiceBlockingStub lockStub = 
                     LockServiceGrpc.newBlockingStub(lockChannel);
                 
@@ -71,12 +75,13 @@ public class LockCacheServiceImpl extends LockCacheServiceGrpc.LockCacheServiceI
 
                 lockEntry.setStatus(LockState.NONE);
                 lockEntry.getRevoked().set(false);
-                logger.info("[Revoke] Successfully released lock");
+                logger.info("[Revoke] Successfully completed revoke");
             } catch (InterruptedException e) {
                 logger.warning("[Revoke] Interrupted while waiting");
                 Thread.currentThread().interrupt();
             } catch (Exception e) {
                 logger.warning("[Revoke] Error releasing lock: " + e.getMessage());
+                e.printStackTrace();
             }
         });
 

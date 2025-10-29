@@ -52,17 +52,20 @@ public class DfsServiceImpl extends DfsServiceGrpc.DfsServiceImplBase {
                 logger.info("[AcquireLock] Lock denied, waiting for retry signal");
                 // Wait for retry signal from lock service
                 lockEntry.getFreeSignal().acquire();
+                logger.info("[AcquireLock] Retry signal received");
             }
 
-            // Acquire the mutex (mutual exclusion)
+            // Acquire the mutex (mutual exclusion for operation)
+            logger.info("[AcquireLock] Acquiring mutex");
             lockEntry.getMutex().acquire();
             lockEntry.setStatus(LockState.LOCKED);
-            logger.info("[AcquireLock] Lock acquired and status set to LOCKED");
+            logger.info("[AcquireLock] Mutex acquired, status set to LOCKED");
         } else {
-            // Lock already acquired by us, just get the mutex
-            logger.info("[AcquireLock] Lock already held, acquiring mutex");
+            // Lock already acquired by us (re-entrant case), just get the mutex
+            logger.info("[AcquireLock] Lock already held (status=" + lockEntry.getStatus() + "), acquiring mutex");
             lockEntry.getMutex().acquire();
             lockEntry.setStatus(LockState.LOCKED);
+            logger.info("[AcquireLock] Mutex acquired");
         }
 
         return true;
@@ -77,14 +80,14 @@ public class DfsServiceImpl extends DfsServiceGrpc.DfsServiceImplBase {
             return;
         }
 
-        // Release the mutex
+        // Release the mutex and update status
         lockEntry.getMutex().release();
         lockEntry.setStatus(LockState.FREE);
         logger.info("[ReleaseLock] Mutex released, status set to FREE");
-
-        // If revoked, signal that we're ready to release
+        
+        // If revoked, signal the revoke task that we're done
         if (lockEntry.getRevoked().get()) {
-            logger.info("[ReleaseLock] Lock was revoked, releasing freeSignal");
+            logger.info("[ReleaseLock] Lock was revoked, releasing freeSignal to wake revoke task");
             lockEntry.getFreeSignal().release();
         }
     }
