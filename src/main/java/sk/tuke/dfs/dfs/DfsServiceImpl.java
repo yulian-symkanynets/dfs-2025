@@ -338,4 +338,45 @@ public class DfsServiceImpl extends DfsServiceGrpc.DfsServiceImplBase {
             logger.info("[DELETE] ========== END DELETE for " + fileName + " ==========");
         }
     }
+
+    @Override
+    public void rmdir(DfsServiceOuterClass.RmdirRequest request,
+                      StreamObserver<DfsServiceOuterClass.RmdirResponse> responseObserver) {
+        final String dirName = request.getDirectoryName();
+        if (!dirName.endsWith("/")) {
+            responseObserver.onNext(DfsServiceOuterClass.RmdirResponse.newBuilder()
+                    .setSuccess(false).build());
+            responseObserver.onCompleted();
+            return;
+        }
+
+        try {
+            waitAndAcquire(dirName);
+
+            // Delete directory by clearing its content
+            var r = extentStub.put(
+                    ExtentServiceOuterClass.PutRequest.newBuilder()
+                            .setFileName(dirName)
+                            .build());
+
+            responseObserver.onNext(DfsServiceOuterClass.RmdirResponse.newBuilder()
+                    .setSuccess(r.getSuccess())
+                    .build());
+            responseObserver.onCompleted();
+        } catch (Exception e) {
+            responseObserver.onNext(DfsServiceOuterClass.RmdirResponse.newBuilder()
+                    .setSuccess(false).build());
+            responseObserver.onCompleted();
+        } finally {
+            releaseLock(dirName);
+        }
+    }
+
+    @Override
+    public void stop(DfsServiceOuterClass.StopRequest request,
+                     StreamObserver<DfsServiceOuterClass.StopResponse> responseObserver) {
+        responseObserver.onNext(DfsServiceOuterClass.StopResponse.getDefaultInstance());
+        responseObserver.onCompleted();
+        System.exit(0);
+    }
 }
