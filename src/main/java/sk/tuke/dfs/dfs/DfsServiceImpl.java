@@ -8,268 +8,309 @@ import dfs.lock.LockServiceGrpc;
 import dfs.lock.LockServiceOuterClass;
 import io.grpc.stub.StreamObserver;
 
-import java.io.File;
-import java.nio.file.Files;
-import java.nio.file.Path;
-
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.logging.Logger;
 
 public class DfsServiceImpl extends DfsServiceGrpc.DfsServiceImplBase {
-    //    private final LockServiceImpl lockService;
-//    private final ExtentServiceGrpc.ExtentServiceBlockingStub extentService;
-//
-//    DfsServiceImpl(LockServiceImpl lockService, ExtentServiceImpl extentService) {
-//        this.lockService = lockService;
-//        this.extentService = extentService;
-//    }
-    private LockServiceGrpc.LockServiceBlockingStub lockServiceBlockingStub;
-    private ExtentServiceGrpc.ExtentServiceBlockingStub extentServiceBlockingStub;
 
-    public DfsServiceImpl(LockServiceGrpc.LockServiceBlockingStub lockServiceBlockingStub, ExtentServiceGrpc.ExtentServiceBlockingStub extentServiceBlockingStub) {
-        super();
-        this.extentServiceBlockingStub = extentServiceBlockingStub;
-        this.lockServiceBlockingStub = lockServiceBlockingStub;
+    private static final Logger logger = Logger.getLogger(DfsServiceImpl.class.getName());
+
+    private final ConcurrentHashMap<String, LockState> lockStateMap;
+    private final ConcurrentHashMap<String, Object> waiters;
+    private final BlockingQueue<String> releaseQueue;
+    private final ConcurrentHashMap<String, Long> lockSequences;
+
+    private final LockServiceGrpc.LockServiceBlockingStub lockStub;
+    private final ExtentServiceGrpc.ExtentServiceBlockingStub extentStub;
+    private final String ownerId;
+
+    public DfsServiceImpl(LockServiceGrpc.LockServiceBlockingStub lockStub,
+                          ExtentServiceGrpc.ExtentServiceBlockingStub extentStub,
+                          String ownerId,
+                          io.grpc.ManagedChannel lockChannel,
+                          ConcurrentHashMap<String, Long> lockSequences,
+                          ConcurrentHashMap<String, LockState> lockStateMap,
+                          ConcurrentHashMap<String, Object> waiters,
+                          BlockingQueue<String> releaseQueue) {
+        this.lockStub = lockStub;
+        this.extentStub = extentStub;
+        this.ownerId = ownerId;
+        this.lockSequences = lockSequences;
+        this.lockStateMap = lockStateMap;
+        this.waiters = waiters;
+        this.releaseQueue = releaseQueue;
     }
 
-    @Override
-    public void stop(DfsServiceOuterClass.StopRequest request, StreamObserver<DfsServiceOuterClass.StopResponse> responseObserver) {
-        super.stop(request, responseObserver);
+    private Object waiter(String lockId) {
+        return waiters.computeIfAbsent(lockId, k -> new Object());
+    }
+
+    private boolean tryAcquireLock(String lid) {
+        long seq = lockSequences.getOrDefault(lid, 0L);
+        logger.info("[TryAcquire] Attempting to acquire " + lid + " with seq=" + seq);
+
+        var res = lockStub.acquire(LockServiceOuterClass.AcquireRequest.newBuilder()
+                .setLockId(lid)
+                .setOwnerId(ownerId)
+                .setSequence(seq)
+                .build());
+
+        logger.info("[TryAcquire] Result for " + lid + ": " + res.getSuccess());
+        return res.getSuccess();
+    }
+
+    private void releaseLock(String lockId) {
+        LockState state = lockStateMap.getOrDefault(lockId, LockState.NONE);
+        logger.info("[ReleaseLock] Releasing " + lockId + " (current state: " + state + ")");
+
+        if (state == LockState.NONE) {
+            logger.info("[ReleaseLock] Lock " + lockId + " already NONE, skipping");
+            return;
+        }
+
+        lockStateMap.put(lockId, LockState.RELEASING);
+
+        try {
+            lockStub.release(
+                    LockServiceOuterClass.ReleaseRequest.newBuilder()
+                            .setLockId(lockId)
+                            .setOwnerId(ownerId)
+                            .build()
+            );
+
+            logger.info("[ReleaseLock] Successfully released " + lockId);
+        } catch (Exception e) {
+            logger.warning("[ReleaseLock] Error releasing " + lockId + ": " + e.getMessage());
+        } finally {
+            lockStateMap.put(lockId, LockState.NONE);
+            logger.info("[ReleaseLock] State set to NONE for " + lockId);
+        }
+    }
+
+    private void waitAndAcquire(String lockId) {
+        logger.info("[WaitAndAcquire] Starting for " + lockId);
+        lockStateMap.put(lockId, LockState.ACQUIRING);
+
+        while (true) {
+            if (tryAcquireLock(lockId)) {
+                lockStateMap.put(lockId, LockState.LOCKED);
+                logger.info("[WaitAndAcquire] Successfully acquired " + lockId);
+                return;
+            }
+
+            logger.info("[WaitAndAcquire] Failed to acquire " + lockId + ", waiting for retry...");
+
+            synchronized (waiter(lockId)) {
+                LockState state = lockStateMap.get(lockId);
+                if (state == LockState.FREE) {
+                    logger.info("[WaitAndAcquire] State is FREE, retrying acquire");
+                    continue;
+                }
+
+                try {
+                    logger.info("[WaitAndAcquire] Waiting on monitor for " + lockId);
+                    waiter(lockId).wait(5000);
+                    logger.info("[WaitAndAcquire] Woke up for " + lockId);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    logger.severe("[WaitAndAcquire] Interrupted while waiting for " + lockId);
+                    throw new RuntimeException(e);
+                }
+            }
+        }
     }
 
     @Override
     public void dir(DfsServiceOuterClass.DirRequest request,
                     StreamObserver<DfsServiceOuterClass.DirResponse> responseObserver) {
-        final String directoryName = request.getDirectoryName();
-
-        // 1) Validate path shape (dirs must end with '/')
-        if (directoryName == null || !directoryName.endsWith("/")) {
-            responseObserver.onNext(
-                    DfsServiceOuterClass.DirResponse.newBuilder()
-                            .setSuccess(false)
-                            .build()
-            );
+        final String dirName = request.getDirectoryName();
+        if (dirName == null || !dirName.endsWith("/")) {
+            responseObserver.onNext(DfsServiceOuterClass.DirResponse.newBuilder()
+                    .setSuccess(false).build());
             responseObserver.onCompleted();
             return;
         }
 
-        boolean acquired = false;
         try {
-            // 2) Acquire lock
-            lockServiceBlockingStub.acquire(
-                    LockServiceOuterClass.AcquireRequest.newBuilder()
-                            .setLockId(directoryName)
-                            .build()
-            );
-            acquired = true;
+            waitAndAcquire(dirName);
 
-            // 3) Call Extent
-            ExtentServiceOuterClass.GetResponse getResponse =
-                    extentServiceBlockingStub.get(
-                            ExtentServiceOuterClass.GetRequest.newBuilder()
-                                    .setFileName(directoryName)
-                                    .build()
-                    );
+            ExtentServiceOuterClass.GetResponse getResp =
+                    extentStub.get(ExtentServiceOuterClass.GetRequest.newBuilder()
+                            .setFileName(dirName)
+                            .build());
 
-            // 4) Handle "null" case (no fileData set)
-            if (!getResponse.hasFileData()) {
-                responseObserver.onNext(
-                        DfsServiceOuterClass.DirResponse.newBuilder()
-                                .setSuccess(false)
-                                .build()
-                );
+            if (!getResp.hasFileData()) {
+                responseObserver.onNext(DfsServiceOuterClass.DirResponse.newBuilder()
+                        .setSuccess(false)
+                        .build());
                 responseObserver.onCompleted();
                 return;
             }
 
-            // 5) Convert bytes -> UTF-8 string -> split into names
-            String listing = String.valueOf(getResponse.getFileData().toStringUtf8());
-            java.util.List<String> names = listing.isBlank()
-                    ? java.util.Collections.emptyList()
+            String listing = getResp.getFileData().toStringUtf8();
+            var names = listing.isBlank()
+                    ? java.util.Collections.<String>emptyList()
                     : java.util.Arrays.stream(listing.split("\n"))
                     .filter(s -> !s.isEmpty())
                     .toList();
 
-            // 6) Respond once with success + names
-            responseObserver.onNext(
-                    DfsServiceOuterClass.DirResponse.newBuilder()
-                            .setSuccess(true)
-                            .addAllDirList(names)
-                            .build()
-            );
-            responseObserver.onCompleted();
-
-        } catch (Exception e) {
-            // On any error: single failure response
-            responseObserver.onNext(
-                    DfsServiceOuterClass.DirResponse.newBuilder()
-                            .setSuccess(false)
-                            .build()
-            );
-            responseObserver.onCompleted();
-
-        } finally {
-            // 7) Always release ONLY if acquire succeeded
-            if (acquired) {
-                try {
-                    lockServiceBlockingStub.release(
-                            LockServiceOuterClass.ReleaseRequest.newBuilder()
-                                    .setLockId(directoryName)
-                                    .build()
-                    );
-                } catch (Exception ignore) {
-                    // log if you want, but don't send another response
-                }
-            }
-        }
-    }
-
-
-    @Override
-    public void mkdir(DfsServiceOuterClass.MkdirRequest request, StreamObserver<DfsServiceOuterClass.MkdirResponse> responseObserver) {
-        if (!request.getDirectoryName().endsWith("/")) {
-            responseObserver.onNext(DfsServiceOuterClass.MkdirResponse.newBuilder().setSuccess(false).build());
-            responseObserver.onCompleted();
-            return;
-        }
-        final String dirName = request.getDirectoryName();
-        boolean aquired = false;
-        try {
-            lockServiceBlockingStub.acquire(LockServiceOuterClass.AcquireRequest.newBuilder().setLockId(dirName).build());
-            aquired = true;
-            ExtentServiceOuterClass.PutResponse putResponse = extentServiceBlockingStub.put(ExtentServiceOuterClass.PutRequest.newBuilder().setFileName(dirName).setFileData(com.google.protobuf.ByteString.copyFromUtf8("init")).build());
-            responseObserver.onNext(DfsServiceOuterClass.MkdirResponse.newBuilder().setSuccess(putResponse.getSuccess()).build());
+            responseObserver.onNext(DfsServiceOuterClass.DirResponse.newBuilder()
+                    .setSuccess(true)
+                    .addAllDirList(names)
+                    .build());
             responseObserver.onCompleted();
         } catch (Exception e) {
-            responseObserver.onNext(
-                    DfsServiceOuterClass.MkdirResponse.newBuilder()
-                            .setSuccess(false)
-                            .build()
-            );
+            logger.warning("[DIR] Error: " + e.getMessage());
+            responseObserver.onNext(DfsServiceOuterClass.DirResponse.newBuilder()
+                    .setSuccess(false).build());
             responseObserver.onCompleted();
-
         } finally {
-            if (aquired) {
-                try {
-                    lockServiceBlockingStub.release(
-                            LockServiceOuterClass.ReleaseRequest.newBuilder()
-                                    .setLockId(dirName)
-                                    .build()
-                    );
-                } catch (Exception ignore) {
-                }
-            }
+            releaseLock(dirName);
         }
     }
 
     @Override
-    public void rmdir(DfsServiceOuterClass.RmdirRequest request, StreamObserver<DfsServiceOuterClass.RmdirResponse> responseObserver) {
+    public void mkdir(DfsServiceOuterClass.MkdirRequest request,
+                      StreamObserver<DfsServiceOuterClass.MkdirResponse> responseObserver) {
         final String dirName = request.getDirectoryName();
         if (!dirName.endsWith("/")) {
-            responseObserver.onNext(DfsServiceOuterClass.RmdirResponse.newBuilder().setSuccess(false).build());
+            responseObserver.onNext(DfsServiceOuterClass.MkdirResponse.newBuilder()
+                    .setSuccess(false).build());
             responseObserver.onCompleted();
             return;
         }
-        boolean aquired = false;
+
         try {
-            lockServiceBlockingStub.acquire(LockServiceOuterClass.AcquireRequest.newBuilder().setLockId(dirName).build());
-            aquired = true;
-            ExtentServiceOuterClass.PutResponse putResponse = extentServiceBlockingStub.put(ExtentServiceOuterClass.PutRequest.newBuilder().setFileName(dirName).build());
-            responseObserver.onNext(DfsServiceOuterClass.RmdirResponse.newBuilder().setSuccess(putResponse.getSuccess()).build());
+            waitAndAcquire(dirName);
+
+            var putResp = extentStub.put(ExtentServiceOuterClass.PutRequest.newBuilder()
+                    .setFileName(dirName)
+                    .setFileData(com.google.protobuf.ByteString.copyFromUtf8("init"))
+                    .build());
+
+            responseObserver.onNext(DfsServiceOuterClass.MkdirResponse.newBuilder()
+                    .setSuccess(putResp.getSuccess())
+                    .build());
             responseObserver.onCompleted();
         } catch (Exception e) {
-            responseObserver.onNext(DfsServiceOuterClass.RmdirResponse.newBuilder().setSuccess(false).build());
+            responseObserver.onNext(DfsServiceOuterClass.MkdirResponse.newBuilder()
+                    .setSuccess(false).build());
             responseObserver.onCompleted();
         } finally {
-            if (aquired) {
-                try {
-                    lockServiceBlockingStub.release(LockServiceOuterClass.ReleaseRequest.newBuilder().setLockId(dirName).build());
-                } catch (Exception ignore) {
-
-                }
-            }
+            releaseLock(dirName);
         }
     }
 
     @Override
-    public void get(DfsServiceOuterClass.GetRequest request, StreamObserver<DfsServiceOuterClass.GetResponse> responseObserver) {
+    public void get(DfsServiceOuterClass.GetRequest request,
+                    StreamObserver<DfsServiceOuterClass.GetResponse> responseObserver) {
         final String fileName = request.getFileName();
         if (fileName.endsWith("/")) {
             responseObserver.onNext(DfsServiceOuterClass.GetResponse.getDefaultInstance());
             responseObserver.onCompleted();
             return;
         }
-        boolean aquired = false;
+
         try {
-            lockServiceBlockingStub.acquire(LockServiceOuterClass.AcquireRequest.newBuilder().setLockId(fileName).build());
-            ExtentServiceOuterClass.GetResponse getResponse = extentServiceBlockingStub.get(ExtentServiceOuterClass.GetRequest.newBuilder().setFileName(fileName).build());
-            responseObserver.onNext(DfsServiceOuterClass.GetResponse.newBuilder().setFileData(getResponse.getFileData()).build());
+            waitAndAcquire(fileName);
+
+            var getResp = extentStub.get(ExtentServiceOuterClass.GetRequest.newBuilder()
+                    .setFileName(fileName)
+                    .build());
+
+            responseObserver.onNext(DfsServiceOuterClass.GetResponse.newBuilder()
+                    .setFileData(getResp.getFileData())
+                    .build());
             responseObserver.onCompleted();
-            aquired = true;
         } catch (Exception e) {
             responseObserver.onNext(DfsServiceOuterClass.GetResponse.getDefaultInstance());
             responseObserver.onCompleted();
         } finally {
-            if (aquired) {
-                try {
-                    lockServiceBlockingStub.release(LockServiceOuterClass.ReleaseRequest.newBuilder().setLockId(fileName).build());
-                } catch (Exception ignore) {
-                }
-            }
+            releaseLock(fileName);
         }
     }
 
     @Override
-    public void put(DfsServiceOuterClass.PutRequest request, StreamObserver<DfsServiceOuterClass.PutResponse> responseObserver) {
-        final String fileName = request.getFileName();
-        if (fileName.endsWith("/")) {
-            responseObserver.onNext(DfsServiceOuterClass.PutResponse.newBuilder().setSuccess(false).build());
-            responseObserver.onCompleted();
+    public void put(DfsServiceOuterClass.PutRequest req,
+                    StreamObserver<DfsServiceOuterClass.PutResponse> resp) {
+        final String file = req.getFileName();
+        logger.info("[PUT] ========== START PUT for " + file + " ==========");
+
+        if (file.endsWith("/")) {
+            resp.onNext(DfsServiceOuterClass.PutResponse.newBuilder().setSuccess(false).build());
+            resp.onCompleted();
+            return;
         }
-        boolean aquired = false;
+
         try {
-            lockServiceBlockingStub.acquire(LockServiceOuterClass.AcquireRequest.newBuilder().setLockId(fileName).build());
-            ExtentServiceOuterClass.PutResponse putResponse = extentServiceBlockingStub.put(ExtentServiceOuterClass.PutRequest.newBuilder().setFileName(fileName).setFileData(request.getFileData()).build());
-            responseObserver.onNext(DfsServiceOuterClass.PutResponse.newBuilder().setSuccess(putResponse.getSuccess()).build());
-            responseObserver.onCompleted();
-            aquired = true;
+            logger.info("[PUT] Calling waitAndAcquire for " + file);
+            waitAndAcquire(file);
+            logger.info("[PUT] Lock acquired for " + file + ", calling extent service");
+
+            var p = extentStub.put(
+                    ExtentServiceOuterClass.PutRequest.newBuilder()
+                            .setFileName(file)
+                            .setFileData(req.getFileData())
+                            .build());
+
+            logger.info("[PUT] Extent service returned success=" + p.getSuccess());
+            resp.onNext(DfsServiceOuterClass.PutResponse.newBuilder()
+                    .setSuccess(p.getSuccess())
+                    .build());
+            resp.onCompleted();
+            logger.info("[PUT] Response sent to client");
         } catch (Exception e) {
-            responseObserver.onNext(DfsServiceOuterClass.PutResponse.newBuilder().setSuccess(false).build());
-            responseObserver.onCompleted();
+            logger.warning("[PUT] Error: " + e.getMessage());
+            e.printStackTrace();
+            resp.onNext(DfsServiceOuterClass.PutResponse.newBuilder().setSuccess(false).build());
+            resp.onCompleted();
         } finally {
-            if (aquired) {
-                try {
-                    lockServiceBlockingStub.release(LockServiceOuterClass.ReleaseRequest.newBuilder().setLockId(fileName).build());
-                } catch (Exception ignore) {
-                }
-            }
+            logger.info("[PUT] Releasing lock for " + file);
+            releaseLock(file);
+            logger.info("[PUT] ========== END PUT for " + file + " ==========");
         }
     }
 
     @Override
-    public void delete(DfsServiceOuterClass.DeleteRequest request, StreamObserver<DfsServiceOuterClass.DeleteResponse> responseObserver) {
+    public void delete(DfsServiceOuterClass.DeleteRequest request,
+                       StreamObserver<DfsServiceOuterClass.DeleteResponse> responseObserver) {
         final String fileName = request.getFileName();
+        logger.info("[DELETE] ========== START DELETE for " + fileName + " ==========");
 
-        if(fileName.endsWith("/")){
-            responseObserver.onNext(DfsServiceOuterClass.DeleteResponse.newBuilder().setSuccess(false).build());
+        if (fileName.endsWith("/")) {
+            responseObserver.onNext(DfsServiceOuterClass.DeleteResponse.newBuilder()
+                    .setSuccess(false).build());
             responseObserver.onCompleted();
             return;
         }
 
-        boolean acquired = false;
+        try {
+            logger.info("[DELETE] Calling waitAndAcquire for " + fileName);
+            waitAndAcquire(fileName);
+            logger.info("[DELETE] Lock acquired for " + fileName);
 
-        try{
-            lockServiceBlockingStub.acquire(LockServiceOuterClass.AcquireRequest.newBuilder().setLockId(fileName).build());
-            acquired = true;
-            ExtentServiceOuterClass.PutResponse putResponse = extentServiceBlockingStub.put(ExtentServiceOuterClass.PutRequest.newBuilder().setFileName(fileName).build());
-            responseObserver.onNext(DfsServiceOuterClass.DeleteResponse.newBuilder().setSuccess(putResponse.getSuccess()).build());
+            var r = extentStub.put(
+                    ExtentServiceOuterClass.PutRequest.newBuilder()
+                            .setFileName(fileName)
+                            .build());
+
+            logger.info("[DELETE] Extent service returned success=" + r.getSuccess());
+            responseObserver.onNext(DfsServiceOuterClass.DeleteResponse.newBuilder()
+                    .setSuccess(r.getSuccess())
+                    .build());
             responseObserver.onCompleted();
-        }catch (Exception e){
-
+            logger.info("[DELETE] Response sent to client");
+        } catch (Exception e) {
+            logger.warning("[DELETE] Error: " + e.getMessage());
+            e.printStackTrace();
+            responseObserver.onNext(DfsServiceOuterClass.DeleteResponse.newBuilder()
+                    .setSuccess(false).build());
+            responseObserver.onCompleted();
         } finally {
-            if(acquired){
-                try {
-                    lockServiceBlockingStub.release(LockServiceOuterClass.ReleaseRequest.newBuilder().setLockId(fileName).build());
-                }catch (Exception ignore){}
-            }
+            logger.info("[DELETE] Releasing lock for " + fileName);
+            releaseLock(fileName);
+            logger.info("[DELETE] ========== END DELETE for " + fileName + " ==========");
         }
     }
 }

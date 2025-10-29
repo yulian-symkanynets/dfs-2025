@@ -3,53 +3,97 @@ package sk.tuke.dfs.lock;
 import dfs.lock.LockServiceGrpc;
 import dfs.lock.LockServiceOuterClass;
 import io.grpc.stub.StreamObserver;
+import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.Semaphore;
+import java.util.concurrent.LinkedBlockingQueue;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
 public class LockServiceImpl extends LockServiceGrpc.LockServiceImplBase {
     Logger logger = Logger.getLogger(LockServiceImpl.class.getName());
-    ConcurrentHashMap<String, Semaphore> locks = new ConcurrentHashMap<>();
+
+    ConcurrentHashMap<String, LockRecord> concurrentHashMap = new ConcurrentHashMap<>();
+
+    BlockingQueue<RevokeRequest> revokeQueue = new LinkedBlockingQueue<>();
+    BlockingQueue<RetryRequest>  retryQueue  = new LinkedBlockingQueue<>();
+
+    public LockServiceImpl() {
+        new Thread(new Revoker(revokeQueue)).start();
+        new Thread(new Retrier(retryQueue)).start();
+    }
 
     @Override
-    public void acquire(LockServiceOuterClass.AcquireRequest request, StreamObserver<LockServiceOuterClass.AcquireResponse> responseObserver) {
-        logger.log(Level.INFO, "Acquire request received");
-        final String lockId = request.getLockId();
+    public void acquire(LockServiceOuterClass.AcquireRequest req,
+                        StreamObserver<LockServiceOuterClass.AcquireResponse> respObs) {
+        String lid = req.getLockId();
+        String cid = req.getOwnerId();
 
-        Semaphore semaphore = locks.computeIfAbsent(lockId, k -> new Semaphore(1, true));
+        LockRecord r = concurrentHashMap.computeIfAbsent(lid, k -> {
+            LockRecord lr = new LockRecord();
+            lr.lockId = lid;
+            return lr;
+        });
 
-        try{
-            semaphore.acquire();
-            responseObserver.onNext(LockServiceOuterClass.AcquireResponse.newBuilder().setSuccess(true).build());
-            responseObserver.onCompleted();
-            logger.info("Acquired lock with id " + lockId);
-        } catch (InterruptedException e) {
-            logger.log(Level.WARNING, "Lock acquisition interrupted");
-            Thread.currentThread().interrupt();
-            responseObserver.onNext(LockServiceOuterClass.AcquireResponse.newBuilder().setSuccess(false).build());
-            responseObserver.onCompleted();
+        synchronized (r) {
+            // free → grant
+            if (r.ownerId == null) {
+                r.ownerId = cid;
+                r.sequence++;
+                respObs.onNext(LockServiceOuterClass.AcquireResponse.newBuilder()
+                        .setSuccess(true).build());
+                respObs.onCompleted();
+                return;
+            }
+            // same owner → ok (cached)
+            if (r.ownerId.equals(cid)) {
+                respObs.onNext(LockServiceOuterClass.AcquireResponse.newBuilder()
+                        .setSuccess(true).build());
+                respObs.onCompleted();
+                return;
+            }
+            // otherwise enqueue + revoke current owner (only once)
+            if (!r.waitingClients.contains(cid))
+                r.waitingClients.add(cid);
+
+            if (!r.revokeSent) {
+                revokeQueue.add(new RevokeRequest(lid, r.ownerId));
+                r.revokeSent = true;
+            }
+
+            respObs.onNext(LockServiceOuterClass.AcquireResponse.newBuilder()
+                    .setSuccess(false).build());
+            respObs.onCompleted();
         }
     }
 
     @Override
-    public void release(LockServiceOuterClass.ReleaseRequest request, StreamObserver<LockServiceOuterClass.ReleaseResponse> responseObserver) {
-        final String lockId = request.getLockId();
-        logger.log(Level.INFO, "Releasing lock with id " + lockId);
+    public void release(LockServiceOuterClass.ReleaseRequest req,
+                        StreamObserver<LockServiceOuterClass.ReleaseResponse> respObs) {
+        String lid = req.getLockId();
+        String cid = req.getOwnerId();
 
-        Semaphore semaphore = locks.get(lockId);
-        try{
-            semaphore.release();
-            responseObserver.onNext(LockServiceOuterClass.ReleaseResponse.getDefaultInstance());
-            responseObserver.onCompleted();
-            logger.info("Released lock with id " + lockId);
-        } catch (Exception e){
-            logger.log(Level.WARNING, "Lock release interrupted");
-            responseObserver.onNext(LockServiceOuterClass.ReleaseResponse.newBuilder().build());
-            responseObserver.onCompleted();
+        LockRecord r = concurrentHashMap.computeIfAbsent(lid, k -> new LockRecord());
+        synchronized (r) {
+            // ignore wrong owner
+            if (r.ownerId == null || !r.ownerId.equals(cid)) {
+                respObs.onNext(LockServiceOuterClass.ReleaseResponse.getDefaultInstance());
+                respObs.onCompleted();
+                return;
+            }
+            r.ownerId = null;
+            r.sequence++;
+            r.revokeSent = false;  // ✅ Reset flag
+
+            // notify next waiting client
+            String next = r.waitingClients.poll();
+            if (next != null)
+                retryQueue.add(new RetryRequest(lid, next, r.sequence));
+
+            respObs.onNext(LockServiceOuterClass.ReleaseResponse.getDefaultInstance());
+            respObs.onCompleted();
         }
-
     }
+
 
     @Override
     public void stop(LockServiceOuterClass.StopRequest request, StreamObserver<LockServiceOuterClass.StopResponse> responseObserver) {
