@@ -75,26 +75,11 @@ public class DfsServiceImpl extends DfsServiceGrpc.DfsServiceImplBase {
             return;
         }
 
-        // If REVOKE_PENDING, release immediately back to server
+        // If REVOKE_PENDING, release immediately back to server via Releaser
         if (state == LockState.REVOKE_PENDING) {
-            logger.info("[ReleaseLock] REVOKE_PENDING, releasing to server immediately");
+            logger.info("[ReleaseLock] REVOKE_PENDING, queueing for release to server");
             lockStateMap.put(lockId, LockState.RELEASING);
-            
-            long seq = lockSequences.getOrDefault(lockId, 0L);
-            try {
-                lockStub.release(
-                        LockServiceOuterClass.ReleaseRequest.newBuilder()
-                                .setLockId(lockId)
-                                .setOwnerId(ownerId)
-                                .setSequence(seq)
-                                .build()
-                );
-                logger.info("[ReleaseLock] Successfully released " + lockId + " to server");
-            } catch (Exception e) {
-                logger.warning("[ReleaseLock] Error releasing " + lockId + ": " + e.getMessage());
-            } finally {
-                lockStateMap.put(lockId, LockState.NONE);
-            }
+            releaseQueue.add(lockId);
             return;
         }
 
