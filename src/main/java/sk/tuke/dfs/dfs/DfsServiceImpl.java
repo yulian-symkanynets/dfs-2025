@@ -35,8 +35,11 @@ public class DfsServiceImpl extends DfsServiceGrpc.DfsServiceImplBase {
 
         LockEntry lockEntry = lockTable.computeIfAbsent(lockId, LockEntry::new);
 
+        LockState currentStatus = lockEntry.getStatus();
+        logger.info("[AcquireLock] Current status: " + currentStatus);
+
         // If lock is in NONE state, we need to acquire it from lock service
-        if (lockEntry.getStatus() == LockState.NONE) {
+        if (currentStatus == LockState.NONE) {
             lockEntry.setStatus(LockState.ACQUIRING);
             logger.info("[AcquireLock] Status is NONE, requesting from lock service");
 
@@ -61,8 +64,8 @@ public class DfsServiceImpl extends DfsServiceGrpc.DfsServiceImplBase {
             lockEntry.setStatus(LockState.LOCKED);
             logger.info("[AcquireLock] Mutex acquired, status set to LOCKED");
         } else {
-            // Lock already acquired by us (re-entrant case), just get the mutex
-            logger.info("[AcquireLock] Lock already held (status=" + lockEntry.getStatus() + "), acquiring mutex");
+            // Lock already in some state - just acquire mutex for this operation
+            logger.info("[AcquireLock] Lock in state " + currentStatus + ", acquiring mutex");
             lockEntry.getMutex().acquire();
             lockEntry.setStatus(LockState.LOCKED);
             logger.info("[AcquireLock] Mutex acquired");

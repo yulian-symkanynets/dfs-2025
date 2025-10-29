@@ -34,16 +34,11 @@ public class LockCacheServiceImpl extends LockCacheServiceGrpc.LockCacheServiceI
     public void revoke(LockCacheServiceOuterClass.RevokeRequest request,
                        StreamObserver<LockCacheServiceOuterClass.RevokeResponse> responseObserver) {
         String lockId = request.getLockId();
-        LockEntry lockEntry = lockTable.get(lockId);
-
+        
         logger.info("[Revoke] Received revoke for " + lockId);
 
-        if (lockEntry == null) {
-            logger.info("[Revoke] Ignored - lock not found");
-            responseObserver.onNext(LockCacheServiceOuterClass.RevokeResponse.getDefaultInstance());
-            responseObserver.onCompleted();
-            return;
-        }
+        // Get or create lock entry
+        LockEntry lockEntry = lockTable.computeIfAbsent(lockId, LockEntry::new);
 
         // Capture current status before changing it
         LockState currentStatus = lockEntry.getStatus();
@@ -96,13 +91,8 @@ public class LockCacheServiceImpl extends LockCacheServiceGrpc.LockCacheServiceI
 
         logger.info("[Retry] Received retry for " + lockId + " seq=" + sequence);
 
-        LockEntry lockEntry = lockTable.get(lockId);
-        if (lockEntry == null) {
-            logger.info("[Retry] Ignored - lock not found");
-            resp.onNext(LockCacheServiceOuterClass.RetryResponse.getDefaultInstance());
-            resp.onCompleted();
-            return;
-        }
+        // Get or create lock entry
+        LockEntry lockEntry = lockTable.computeIfAbsent(lockId, LockEntry::new);
 
         lockEntry.setStatus(LockState.ACQUIRING);
         logger.info("[Retry] Set status to ACQUIRING, submitting async acquire task");
