@@ -9,9 +9,7 @@ import io.grpc.ServerBuilder;
 
 import java.net.InetAddress;
 import java.util.UUID;
-import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.LinkedBlockingQueue;
 
 /**
  * DFS Server entry point.
@@ -49,24 +47,12 @@ public class DfsServer {
         ExtentServiceGrpc.ExtentServiceBlockingStub extentStub = ExtentServiceGrpc.newBlockingStub(extentCh);
 
         // -------------------- Shared state --------------------
-        ConcurrentHashMap<String, LockState> lockStateMap = new ConcurrentHashMap<>();
-        ConcurrentHashMap<String, Object> waiters = new ConcurrentHashMap<>();
-        ConcurrentHashMap<String, Long> lockSequences = new ConcurrentHashMap<>();
-        BlockingQueue<String> releaseQueue = new LinkedBlockingQueue<>();
+        ConcurrentHashMap<String, LockEntry> lockTable = new ConcurrentHashMap<>();
 
         // -------------------- Unique IDs --------------------
         String baseAddr = InetAddress.getLocalHost().getHostAddress() + ":" + dfsPort;
         String dfsOwnerId = baseAddr + ":dfs-" + UUID.randomUUID();
         System.out.println("[DFS] DFS OwnerId   = " + dfsOwnerId);
-
-        // -------------------- Start Releaser Thread ONCE --------------------
-        Thread releaserThread = new Thread(
-                new Releaser(releaseQueue, lockStateMap, lockCh, dfsOwnerId),
-                "ReleaserThread"
-        );
-        releaserThread.setDaemon(true);
-        releaserThread.start();
-        System.out.println("[DFS] Releaser thread started");
 
         // -------------------- gRPC Server setup --------------------
         Server server = ServerBuilder
@@ -76,20 +62,13 @@ public class DfsServer {
                         lockStub,
                         extentStub,
                         dfsOwnerId,
-                        lockCh,
-                        lockSequences,
-                        lockStateMap,
-                        waiters,
-                        releaseQueue
+                        lockTable
                 ))
                 // Local lock cache (revoke/retry handling)
                 .addService(new LockCacheServiceImpl(
-                        lockStateMap,
+                        lockTable,
                         lockCh,
-                        dfsOwnerId,
-                        lockSequences,
-                        waiters,
-                        releaseQueue
+                        dfsOwnerId
                 ))
                 .addService(io.grpc.protobuf.services.ProtoReflectionService.newInstance())
                 .build()
