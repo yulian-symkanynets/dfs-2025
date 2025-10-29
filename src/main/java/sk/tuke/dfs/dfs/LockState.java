@@ -6,6 +6,5 @@ public enum LockState {
     LOCKED,
     ACQUIRING,
     RELEASING,
-    RETRY,REVOKE_PENDING
-
+    REVOKE_PENDING
 }

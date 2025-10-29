@@ -47,7 +47,14 @@ public class DfsServiceImpl extends DfsServiceGrpc.DfsServiceImplBase {
     }
 
     private boolean tryAcquireLock(String lid) {
+        // Use current sequence value (set by retry or increment for new attempts)
         long seq = lockSequences.getOrDefault(lid, 0L);
+        if (seq == 0) {
+            // First acquire for this lock
+            seq = 1;
+            lockSequences.put(lid, seq);
+        }
+        
         logger.info("[TryAcquire] Attempting to acquire " + lid + " with seq=" + seq);
 
         var res = lockStub.acquire(LockServiceOuterClass.AcquireRequest.newBuilder()
@@ -69,27 +76,36 @@ public class DfsServiceImpl extends DfsServiceGrpc.DfsServiceImplBase {
             return;
         }
 
-        lockStateMap.put(lockId, LockState.RELEASING);
-
-        try {
-            lockStub.release(
-                    LockServiceOuterClass.ReleaseRequest.newBuilder()
-                            .setLockId(lockId)
-                            .setOwnerId(ownerId)
-                            .build()
-            );
-
-            logger.info("[ReleaseLock] Successfully released " + lockId);
-        } catch (Exception e) {
-            logger.warning("[ReleaseLock] Error releasing " + lockId + ": " + e.getMessage());
-        } finally {
-            lockStateMap.put(lockId, LockState.NONE);
-            logger.info("[ReleaseLock] State set to NONE for " + lockId);
+        // If REVOKE_PENDING, release immediately back to server via Releaser
+        if (state == LockState.REVOKE_PENDING) {
+            logger.info("[ReleaseLock] REVOKE_PENDING, queueing for release to server");
+            lockStateMap.put(lockId, LockState.RELEASING);
+            releaseQueue.add(lockId);
+            return;
         }
+
+        // Otherwise, just cache it locally (set to FREE)
+        lockStateMap.put(lockId, LockState.FREE);
+        logger.info("[ReleaseLock] Cached lock " + lockId + " locally (FREE)");
     }
 
     private void waitAndAcquire(String lockId) {
         logger.info("[WaitAndAcquire] Starting for " + lockId);
+        
+        LockState current = lockStateMap.getOrDefault(lockId, LockState.NONE);
+        
+        // If already FREE (cached), just mark as LOCKED
+        if (current == LockState.FREE) {
+            lockStateMap.put(lockId, LockState.LOCKED);
+            logger.info("[WaitAndAcquire] Lock " + lockId + " was cached (FREE), now LOCKED");
+            return;
+        }
+        
+        // Starting a new acquire from server - increment sequence
+        long seq = lockSequences.getOrDefault(lockId, 0L) + 1;
+        lockSequences.put(lockId, seq);
+        logger.info("[WaitAndAcquire] New acquire for " + lockId + ", incremented seq to " + seq);
+        
         lockStateMap.put(lockId, LockState.ACQUIRING);
 
         while (true) {
@@ -312,5 +328,46 @@ public class DfsServiceImpl extends DfsServiceGrpc.DfsServiceImplBase {
             releaseLock(fileName);
             logger.info("[DELETE] ========== END DELETE for " + fileName + " ==========");
         }
+    }
+
+    @Override
+    public void rmdir(DfsServiceOuterClass.RmdirRequest request,
+                      StreamObserver<DfsServiceOuterClass.RmdirResponse> responseObserver) {
+        final String dirName = request.getDirectoryName();
+        if (!dirName.endsWith("/")) {
+            responseObserver.onNext(DfsServiceOuterClass.RmdirResponse.newBuilder()
+                    .setSuccess(false).build());
+            responseObserver.onCompleted();
+            return;
+        }
+
+        try {
+            waitAndAcquire(dirName);
+
+            // Delete directory by clearing its content
+            var r = extentStub.put(
+                    ExtentServiceOuterClass.PutRequest.newBuilder()
+                            .setFileName(dirName)
+                            .build());
+
+            responseObserver.onNext(DfsServiceOuterClass.RmdirResponse.newBuilder()
+                    .setSuccess(r.getSuccess())
+                    .build());
+            responseObserver.onCompleted();
+        } catch (Exception e) {
+            responseObserver.onNext(DfsServiceOuterClass.RmdirResponse.newBuilder()
+                    .setSuccess(false).build());
+            responseObserver.onCompleted();
+        } finally {
+            releaseLock(dirName);
+        }
+    }
+
+    @Override
+    public void stop(DfsServiceOuterClass.StopRequest request,
+                     StreamObserver<DfsServiceOuterClass.StopResponse> responseObserver) {
+        responseObserver.onNext(DfsServiceOuterClass.StopResponse.getDefaultInstance());
+        responseObserver.onCompleted();
+        System.exit(0);
     }
 }
